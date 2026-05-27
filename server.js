@@ -8,12 +8,10 @@ const PORT = process.env.PORT || 3001;
 app.use(cors());
 app.use(express.json());
 
-// Health check
 app.get('/', (req, res) => {
   res.json({ status: 'Brand Audit Server is running' });
 });
 
-// Main scrape endpoint
 app.post('/scrape', async (req, res) => {
   const { url } = req.body;
   if (!url) return res.status(400).json({ error: 'URL is required' });
@@ -21,57 +19,58 @@ app.post('/scrape', async (req, res) => {
   let browser;
   try {
     browser = await puppeteer.launch({
-      headless: 'new',
+      headless: true,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-features=IsolateOrigins,site-per-process',
         '--no-first-run',
-        '--no-zygote',
-        '--single-process',
-        '--disable-gpu'
+        '--disable-gpu',
+        '--window-size=1440,900'
       ]
     });
 
     const page = await browser.newPage();
 
-    // Set a real browser user agent so sites don't block us
-    await page.setUserAgent(
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    );
-
-    // Set viewport
-    await page.setViewport({ width: 1440, height: 900 });
-
-    // Navigate to URL, wait for the page to fully load
-    await page.goto(url, {
-      waitUntil: 'networkidle2',
-      timeout: 30000
+    // Hide automation signals
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
+      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+      window.chrome = { runtime: {} };
     });
 
-    // If there's an HCP wall or cookie banner, try to click through it
-    await clickThroughWalls(page);
+    await page.setUserAgent(
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+    );
+    await page.setViewport({ width: 1440, height: 900 });
+    await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
 
-    // Wait a moment for any animations/lazy loads
+    // Navigate
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+    // Wait for page to settle
+    await new Promise(r => setTimeout(r, 3000));
+
+    // Try clicking through walls multiple times
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await clickThroughWalls(page);
+      await new Promise(r => setTimeout(r, 1500));
+    }
+
+    // Wait for any post-click rendering
     await new Promise(r => setTimeout(r, 2000));
 
-    // Extract all brand data from the rendered page
     const brandData = await page.evaluate(() => {
-      const results = {
-        title: document.title,
-        metaDescription: document.querySelector('meta[name="description"]')?.content || '',
-        colors: [],
-        fonts: [],
-        images: []
-      };
+      const results = { title: document.title, metaDescription: '', colors: [], fonts: [], images: [] };
 
-      // ── COLORS ──
-      // Walk every element and collect computed background-color and color
+      results.metaDescription = document.querySelector('meta[name="description"]')?.content || '';
+
+      // Colors
       const colorMap = {};
-      const allElements = document.querySelectorAll('*');
-
-      allElements.forEach(el => {
+      document.querySelectorAll('*').forEach(el => {
         const style = window.getComputedStyle(el);
         const rect = el.getBoundingClientRect();
         const area = rect.width * rect.height;
@@ -81,10 +80,9 @@ app.post('/scrape', async (req, res) => {
           const match = colorStr.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
           if (!match) return;
           const r = parseInt(match[1]), g = parseInt(match[2]), b = parseInt(match[3]);
-          // Skip pure white and pure black and transparent
-          if ((r > 248 && g > 248 && b > 248)) return;
-          if ((r < 8 && g < 8 && b < 8)) return;
-          const hex = '#' + [r, g, b].map(x => x.toString(16).padStart(2, '0')).join('');
+          if (r > 248 && g > 248 && b > 248) return;
+          if (r < 8 && g < 8 && b < 8) return;
+          const hex = '#' + [r,g,b].map(x => x.toString(16).padStart(2,'0')).join('');
           colorMap[hex] = (colorMap[hex] || 0) + Math.max(area, 1);
         };
 
@@ -93,70 +91,48 @@ app.post('/scrape', async (req, res) => {
         collectColor(style.borderColor);
       });
 
-      // Also scan inline SVG fill/stroke attributes
+      // SVG colors
       document.querySelectorAll('[fill],[stroke]').forEach(el => {
-        ['fill', 'stroke'].forEach(attr => {
+        ['fill','stroke'].forEach(attr => {
           const val = el.getAttribute(attr);
-          if (val && val.startsWith('#') && val.length >= 4) {
-            let hex = val;
-            if (hex.length === 4) {
-              hex = '#' + hex[1]+hex[1]+hex[2]+hex[2]+hex[3]+hex[3];
-            }
+          if (val && val.startsWith('#')) {
+            let hex = val.length === 4
+              ? '#' + val[1]+val[1]+val[2]+val[2]+val[3]+val[3]
+              : val;
             colorMap[hex] = (colorMap[hex] || 0) + 500;
           }
         });
       });
 
-      // Sort by area weight and return top colors
-      const sortedColors = Object.entries(colorMap)
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 12);
-
-      const totalArea = sortedColors.reduce((s, [, v]) => s + v, 0);
-      results.colors = sortedColors.map(([hex, area]) => ({
+      const sorted = Object.entries(colorMap).sort((a,b) => b[1]-a[1]).slice(0,12);
+      const total = sorted.reduce((s,[,v]) => s+v, 0);
+      results.colors = sorted.map(([hex, area]) => ({
         hex,
-        dominance: Math.round((area / totalArea) * 100) / 100
+        dominance: Math.round((area/total)*100)/100
       }));
 
-      // ── FONTS ──
+      // Fonts
       const fontSet = new Set();
-      allElements.forEach(el => {
+      const skip = new Set(['serif','sans-serif','monospace','cursive','fantasy','system-ui','-apple-system','BlinkMacSystemFont']);
+      document.querySelectorAll('*').forEach(el => {
         const ff = window.getComputedStyle(el).fontFamily;
-        if (ff) {
-          ff.split(',').forEach(f => {
-            const clean = f.trim().replace(/['"]/g, '');
-            if (
-              clean &&
-              !['serif', 'sans-serif', 'monospace', 'cursive', 'fantasy', 'system-ui', '-apple-system', 'BlinkMacSystemFont'].includes(clean)
-            ) {
-              fontSet.add(clean);
-            }
-          });
-        }
+        if (ff) ff.split(',').forEach(f => {
+          const clean = f.trim().replace(/['"]/g,'');
+          if (clean && !skip.has(clean)) fontSet.add(clean);
+        });
       });
-      results.fonts = [...fontSet].slice(0, 6);
+      results.fonts = [...fontSet].slice(0,6);
 
-      // ── IMAGES ──
-      const imgs = [...document.querySelectorAll('img')]
+      // Images
+      results.images = [...document.querySelectorAll('img')]
         .filter(img => img.naturalWidth > 80 && img.naturalHeight > 80)
-        .slice(0, 8)
-        .map(img => img.src);
-      results.images = imgs;
+        .slice(0,8).map(img => img.src);
 
       return results;
     });
 
     await browser.close();
-
-    res.json({
-      success: true,
-      url,
-      title: brandData.title,
-      metaDescription: brandData.metaDescription,
-      colors: brandData.colors,
-      fonts: brandData.fonts,
-      images: brandData.images
-    });
+    res.json({ success: true, url, ...brandData });
 
   } catch (err) {
     if (browser) await browser.close().catch(() => {});
@@ -165,57 +141,46 @@ app.post('/scrape', async (req, res) => {
   }
 });
 
-// Try to click through common walls: cookie banners, HCP gates, age gates
 async function clickThroughWalls(page) {
-  const clickTargets = [
-    // HCP confirmation buttons
-    'button[class*="hcp"]',
-    'button[class*="confirm"]',
-    'button[class*="agree"]',
-    'a[class*="hcp"]',
-    // Cookie banners
-    'button[id*="accept"]',
-    'button[class*="accept"]',
-    'button[id*="cookie"]',
+  const selectors = [
     '#onetrust-accept-btn-handler',
     '.onetrust-accept-btn-handler',
-    'button[aria-label*="accept"]',
-    // Age gates
-    'button[class*="age"]',
-    'input[value="Yes"]',
+    'button[id*="accept"]',
+    'button[class*="accept"]',
+    'button[class*="agree"]',
+    'button[class*="confirm"]',
+    'button[class*="hcp"]',
+    'a[class*="hcp"]',
+    'button[class*="continue"]',
+    '[data-testid*="accept"]',
+    '[aria-label*="accept"]',
   ];
 
-  // Also look for buttons with relevant text
-  const textPhrases = [
-    'i am a healthcare', 'hcp', 'confirm', 'i agree', 'accept all',
-    'accept cookies', 'yes, i am', 'continue', 'i understand', 'acknowledge'
-  ];
-
-  for (const selector of clickTargets) {
+  for (const sel of selectors) {
     try {
-      const el = await page.$(selector);
-      if (el) {
-        await el.click();
-        await new Promise(r => setTimeout(r, 1000));
-        return;
-      }
-    } catch (e) {}
+      const el = await page.$(sel);
+      if (el) { await el.click(); await new Promise(r => setTimeout(r, 800)); return; }
+    } catch(e) {}
   }
 
-  // Text-based search for confirmation buttons
+  // Text-based button search
+  const phrases = [
+    'i am a healthcare','hcp','confirm','i agree','accept all',
+    'accept cookies','yes, i am','continue','i understand',
+    'acknowledge','i certify','healthcare professional','proceed'
+  ];
+
   try {
-    const buttons = await page.$$('button, a[role="button"], input[type="button"], input[type="submit"]');
+    const buttons = await page.$$('button, a[role="button"], input[type="button"], input[type="submit"], a');
     for (const btn of buttons) {
-      const text = await page.evaluate(el => el.textContent?.toLowerCase() || '', btn);
-      if (textPhrases.some(phrase => text.includes(phrase))) {
+      const text = await page.evaluate(el => el.textContent?.toLowerCase().trim() || '', btn);
+      if (phrases.some(p => text.includes(p))) {
         await btn.click();
-        await new Promise(r => setTimeout(r, 1000));
+        await new Promise(r => setTimeout(r, 800));
         return;
       }
     }
-  } catch (e) {}
+  } catch(e) {}
 }
 
-app.listen(PORT, () => {
-  console.log(`Brand Audit Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Brand Audit Server running on port ${PORT}`));
