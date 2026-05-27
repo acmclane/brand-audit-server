@@ -1,17 +1,16 @@
 {
   "name": "brand-audit-server",
   "version": "1.0.0",
-  "description": "Brand audit scraping server using Puppeteer",
+  "description": "Brand audit scraping server",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js",
-    "postinstall": "npx puppeteer browsers install chrome"
+    "start": "node server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.18.2",
-    "puppeteer": "^24.15.0"
+    "puppeteer-core": "^23.0.0",
+    "@sparticuz/chromium": "^131.0.0"
   },
   "engines": {
     "node": "20.x"
