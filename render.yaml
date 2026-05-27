@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: brand-audit-server
+    env: node
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: PORT
+        value: 3001
